@@ -1,0 +1,11 @@
+# Ignore local data collection and outputs
+data/
+logs/
+obfiles/
+plots/
+plots_summary/
+
+# Ignore python cache files
+__pycache__/
+*.pyc
+.DS_Store
