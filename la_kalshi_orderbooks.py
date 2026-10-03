@@ -200,9 +200,8 @@ def analyze_consensus_arbitrage(market_name, df_snap, consensus_price, alert_log
 
 def generate_visual_plots(market_name, target_date_str, time_str, df_snap, consensus_price):
     """
-    Renders tomorrow's full option chain distributions without clipping,
-    layers the consensus line, and dynamically extracts the hardcoded 
-    settlement price from today's finalized market payload.
+    Renders tomorrow's full option chain distributions, layers the consensus line,
+    and dynamically extracts the true settlement prices from Kalshi with verbose debugging.
     """
     plt.figure(figsize=(10, 5))
     
@@ -215,41 +214,88 @@ def generate_visual_plots(market_name, target_date_str, time_str, df_snap, conse
     if not valid_last.empty:
         plt.scatter(df_snap['Strike_Rung'], valid_last['Last_Traded_Price'], color='blue', zorder=5, s=35, label='Last Price')
         
-    # Blue dashed line representing current session implied consensus
     if consensus_price:
         plt.axvline(x=consensus_price, color='blue', linestyle='--', linewidth=1.5, 
                     label=f"Implied Market Consensus (${consensus_price:.4f})")
         
     # ----------------------------------------------------
-    # DYNAMIC LIVE SETTLEMENT EXTRACTION ENGINE
+    # VERBOSE LIVE SETTLEMENT DEBUG ENGINE
     # ----------------------------------------------------
-    # Instead of reading a stale file, we query today's finalized ticker 
-    # directly from the live API to find the exact historical benchmark.
     last_settled_price = None
     series_prefixes = {'US': 'KXAAAGASD', 'TX': 'KXAAAGASDTX', 'NC': 'KXAAAGASDNC'}
     prefix = series_prefixes.get(market_name, 'KXAAAGASD')
     
-    # Today's ticker date string (e.g., 26SEP30)
+    # Today's ticker date suffix (e.g., 26SEP30)
     today_ticker_date = datetime.now().strftime('%y%b%d').upper()
     today_event_ticker = f"{prefix}-{today_ticker_date}"
     
     url = f"https://external-api.kalshi.com/trade-api/v2/events/{today_event_ticker}"
+    
+    print(f"\n[DEBUG: {market_name}] Querying live settlement baseline...")
+    print(f"  -> Target URL: {url}")
+    
     try:
         res = requests.get(url, timeout=5)
+        print(f"  -> HTTP Status Code: {res.status_code}")
+        
         if res.status_code == 200:
-            markets = res.json().get('markets', [])
-            if markets:
-                # Target the exact finalized value Kalshi locks into the market metadata
-                exp_val = markets[0].get('expiration_value')
-                if exp_val and str(exp_val).strip():
-                    last_settled_price = float(exp_val)
-    except Exception:
-        pass
+            payload = res.json()
+            
+            # Debug the base dictionary wrapper keys returned by Kalshi
+            available_keys = list(payload.keys())
+            print(f"  -> Top-level JSON keys returned: {available_keys}")
+            
+            # Check Event-level arrays vs single Market structures
+            event_data = payload.get('event', {})
+            markets_list = payload.get('markets', [])
+            single_market = payload.get('market', {})
+            
+            exp_val = None
+            
+            if isinstance(markets_list, list) and len(markets_list) > 0:
+                print(f"  -> Detected plural 'markets' list array with {len(markets_list)} rungs.")
+                # Pull from the first available rung inside the list
+                exp_val = markets_list[0].get('expiration_value')
+                print(f"  -> First market rung ticker: {markets_list[0].get('ticker')}")
+                print(f"  -> First market rung expiration_value raw: '{exp_val}'")
+                
+            elif single_market:
+                print("  -> Detected singular 'market' dictionary structure.")
+                exp_val = single_market.get('expiration_value')
+                print(f"  -> Singular market expiration_value raw: '{exp_val}'")
+                
+            elif event_data:
+                print("  -> Detected broad event dictionary data metadata node.")
+                
+            # If the market array keys are still hidden or structured down a level:
+            if exp_val is None and isinstance(markets_list, list) and len(markets_list) > 0:
+                # Check for alternative 'settlement_value_dollars' or scan loop results
+                print("  -> Expiration value blank. Scanning for active 'result' triggers...")
+                for m in markets_list:
+                    if m.get('status') == 'finalized' and m.get('result') == 'yes':
+                        strike = m.get('floor_strike') or m.get('cap_strike')
+                        if strike is not None:
+                            exp_val = strike
+                            print(f"  -> Found winning settled 'yes' rung at strike floor: {strike}")
+                            break
+            
+            if exp_val and str(exp_val).strip() != "":
+                last_settled_price = float(exp_val)
+                print(f"  -> 🎉 SUCCESS: Extracted settled price baseline: ${last_settled_price:.4f}")
+            else:
+                print("  -> ⚠️ WARNING: No valid final expiration_value string could be isolated from this endpoint.")
+        else:
+            print(f"  -> ❌ Error response body: {res.text[:150]}")
+            
+    except Exception as e:
+        print(f"  -> 💥 CRITICAL NETWORK/PARSING EXCEPTION: {str(e)}")
 
-    # Draw the gray vertical baseline line if found via the live API query
+    # Draw the gray vertical baseline line if successfully resolved
     if last_settled_price:
         plt.axvline(x=last_settled_price, color='gray', linestyle='-', linewidth=1.5, 
                     label=f"Prev Day Settled Close (${last_settled_price:.4f})")
+    else:
+        print("  -> 📉 Chart Alert: Gray reference baseline omitted due to missing settlement value.")
             
     plt.title(f"Complete Option Chain Curve: {market_name} (For Target: {target_date_str})")
     plt.xlabel("Contract Strike Rungs ($)")
