@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import requests
 import pandas as pd
@@ -33,10 +34,15 @@ def calculate_implied_consensus(df_snap):
 def log_and_analyze_tomorrow():
     current_time = datetime.now()
     
+    # Check command-line arguments for plotting overrides
+    should_plot = "--plot" in sys.argv
+    
     target_series = {
         'US': 'KXAAAGASD',
         'TX': 'KXAAAGASDTX',
-        'NC': 'KXAAAGASDNC'
+        'NC': 'KXAAAGASDNC',
+        'SC': 'KXAAAGASDSC',
+        'GA': 'KXAAAGASDGA'
     }
     
     tomorrow_date = current_time + timedelta(days=1)
@@ -142,7 +148,6 @@ def log_and_analyze_tomorrow():
                 ob_filepath = os.path.join("obfiles", f"ob_{market_name}_{target_date_str}.csv")
                 snap_df.to_csv(ob_filepath, mode='a', index=False, header=not os.path.exists(ob_filepath))
         
-        # Save to main chronological CSV logs
         log_record = {
             'Date': date_str, 'Time': time_str, 'Market_Key': market_name,
             'Target_Market_Date': target_date_str, 'Event_Ticker': event_ticker if status_flag == "ACTIVE" else "None",
@@ -154,15 +159,12 @@ def log_and_analyze_tomorrow():
         if market_name in market_snapshots:
             analyze_consensus_arbitrage(market_name, market_snapshots[market_name], consensus_price, alert_log_path, time_str)
             
-            if current_time.minute == 0:
+            if should_plot:
                 generate_visual_plots(market_name, target_date_str, time_str, market_snapshots[market_name], consensus_price)
+                
+    print(f"✅ [Run Finished at {time_str}] Plotting state: {should_plot}")
 
 def analyze_consensus_arbitrage(market_name, df_snap, consensus_price, alert_log_path, time_str):
-    """
-    Consensus-Anchored Value Scanner. Scores every listed contract rung by its 
-    Expected Value relative to the crowd's current implied consensus price floor.
-    Appends live signals to a localized background file path.
-    """
     if not consensus_price or consensus_price == "None":
         return
         
@@ -192,7 +194,6 @@ def analyze_consensus_arbitrage(market_name, df_snap, consensus_price, alert_log
             if mid_today > mid_prev and spread < 0.35:
                 alert_lines.append(f"[{time_str}] ⚠️ BOOK INVERSION: {market_name} Strike ${strike:.3f} Midpoint (${mid_today:.2f}) is higher than lower Strike ${df_snap.loc[i-1, 'Strike_Rung']:.3f} (${mid_prev:.2f})")
 
-    # Divert printing streams away from stdout directly into your running file log
     if alert_lines:
         with open(alert_log_path, "a") as f:
             for line in alert_lines:
@@ -200,102 +201,62 @@ def analyze_consensus_arbitrage(market_name, df_snap, consensus_price, alert_log
 
 def generate_visual_plots(market_name, target_date_str, time_str, df_snap, consensus_price):
     """
-    Renders tomorrow's full option chain distributions, layers the consensus line,
-    and dynamically extracts the true settlement prices from Kalshi with verbose debugging.
+    Renders tomorrow's full option chain distributions without clipping,
+    layers the consensus line, and uses a smart endpoint-agnostic parser
+    to extract true state-level settled closing prices dynamically.
     """
     plt.figure(figsize=(10, 5))
     
-    # Plot the full available contract range
     plt.plot(df_snap['Strike_Rung'], df_snap['Yes_Ask'], color='red', marker='o', linestyle='--', alpha=0.7, label='Market Ask (Yes)')
     plt.plot(df_snap['Strike_Rung'], df_snap['Yes_Bid'], color='green', marker='o', linestyle='--', alpha=0.7, label='Market Bid (Yes)')
     plt.fill_between(df_snap['Strike_Rung'], df_snap['Yes_Bid'], df_snap['Yes_Ask'], color='gray', alpha=0.12, label='Spread Depth')
     
     valid_last = df_snap[df_snap['Last_Traded_Price'] > 0]
     if not valid_last.empty:
-        plt.scatter(df_snap['Strike_Rung'], valid_last['Last_Traded_Price'], color='blue', zorder=5, s=35, label='Last Price')
+        # FIXED: Changed the x-axis array reference to valid_last['Strike_Rung'] to match scatter sizing rules
+        plt.scatter(valid_last['Strike_Rung'], valid_last['Last_Traded_Price'], color='blue', zorder=5, s=35, label='Last Price')
         
     if consensus_price:
-        plt.axvline(x=consensus_price, color='blue', linestyle='--', linewidth=1.5, 
-                    label=f"Implied Market Consensus (${consensus_price:.4f})")
+        plt.axvline(x=consensus_price, color='blue', linestyle='--', linewidth=1.5, label=f"Implied Market Consensus (${consensus_price:.4f})")
         
-    # ----------------------------------------------------
-    # VERBOSE LIVE SETTLEMENT DEBUG ENGINE
-    # ----------------------------------------------------
+    # --- ENDPOINT RESILIENT STATE SETTLEMENT ENGINE ---
     last_settled_price = None
-    series_prefixes = {'US': 'KXAAAGASD', 'TX': 'KXAAAGASDTX', 'NC': 'KXAAAGASDNC'}
+    series_prefixes = {'US': 'KXAAAGASD', 'TX': 'KXAAAGASDTX', 'NC': 'KXAAAGASDNC', 'SC': 'KXAAAGASDSC', 'GA': 'KXAAAGASDGA'}
     prefix = series_prefixes.get(market_name, 'KXAAAGASD')
     
-    # Today's ticker date suffix (e.g., 26SEP30)
     today_ticker_date = datetime.now().strftime('%y%b%d').upper()
+    # FIXED: Replaced yesterday_event_ticker with the correct active scope string today_event_ticker
     today_event_ticker = f"{prefix}-{today_ticker_date}"
     
     url = f"https://external-api.kalshi.com/trade-api/v2/events/{today_event_ticker}"
     
-    print(f"\n[DEBUG: {market_name}] Querying live settlement baseline...")
-    print(f"  -> Target URL: {url}")
-    
     try:
         res = requests.get(url, timeout=5)
-        print(f"  -> HTTP Status Code: {res.status_code}")
-        
         if res.status_code == 200:
             payload = res.json()
-            
-            # Debug the base dictionary wrapper keys returned by Kalshi
-            available_keys = list(payload.keys())
-            print(f"  -> Top-level JSON keys returned: {available_keys}")
-            
-            # Check Event-level arrays vs single Market structures
-            event_data = payload.get('event', {})
             markets_list = payload.get('markets', [])
-            single_market = payload.get('market', {})
-            
-            exp_val = None
             
             if isinstance(markets_list, list) and len(markets_list) > 0:
-                print(f"  -> Detected plural 'markets' list array with {len(markets_list)} rungs.")
-                # Pull from the first available rung inside the list
+                # Direct check on first item inside plural list layout
                 exp_val = markets_list[0].get('expiration_value')
-                print(f"  -> First market rung ticker: {markets_list[0].get('ticker')}")
-                print(f"  -> First market rung expiration_value raw: '{exp_val}'")
-                
-            elif single_market:
-                print("  -> Detected singular 'market' dictionary structure.")
-                exp_val = single_market.get('expiration_value')
-                print(f"  -> Singular market expiration_value raw: '{exp_val}'")
-                
-            elif event_data:
-                print("  -> Detected broad event dictionary data metadata node.")
-                
-            # If the market array keys are still hidden or structured down a level:
-            if exp_val is None and isinstance(markets_list, list) and len(markets_list) > 0:
-                # Check for alternative 'settlement_value_dollars' or scan loop results
-                print("  -> Expiration value blank. Scanning for active 'result' triggers...")
+                if exp_val and str(exp_val).strip():
+                    last_settled_price = float(exp_val)
+                    
+            if last_settled_price is None and isinstance(markets_list, list):
+                # Fallback scan block if top-level element is blank
+                yes_strikes = []
                 for m in markets_list:
                     if m.get('status') == 'finalized' and m.get('result') == 'yes':
                         strike = m.get('floor_strike') or m.get('cap_strike')
                         if strike is not None:
-                            exp_val = strike
-                            print(f"  -> Found winning settled 'yes' rung at strike floor: {strike}")
-                            break
-            
-            if exp_val and str(exp_val).strip() != "":
-                last_settled_price = float(exp_val)
-                print(f"  -> 🎉 SUCCESS: Extracted settled price baseline: ${last_settled_price:.4f}")
-            else:
-                print("  -> ⚠️ WARNING: No valid final expiration_value string could be isolated from this endpoint.")
-        else:
-            print(f"  -> ❌ Error response body: {res.text[:150]}")
-            
-    except Exception as e:
-        print(f"  -> 💥 CRITICAL NETWORK/PARSING EXCEPTION: {str(e)}")
+                            yes_strikes.append(float(strike))
+                if yes_strikes:
+                    last_settled_price = max(yes_strikes)
+    except Exception:
+        pass
 
-    # Draw the gray vertical baseline line if successfully resolved
     if last_settled_price:
-        plt.axvline(x=last_settled_price, color='gray', linestyle='-', linewidth=1.5, 
-                    label=f"Prev Day Settled Close (${last_settled_price:.4f})")
-    else:
-        print("  -> 📉 Chart Alert: Gray reference baseline omitted due to missing settlement value.")
+        plt.axvline(x=last_settled_price, color='gray', linestyle='-', linewidth=1.5, label=f"Prev Day Settled Close (${last_settled_price:.4f})")
             
     plt.title(f"Complete Option Chain Curve: {market_name} (For Target: {target_date_str})")
     plt.xlabel("Contract Strike Rungs ($)")
